@@ -1,12 +1,9 @@
-// server.js
 const express = require("express");
 const cors = require("cors");
 const dotenv = require("dotenv");
 const jwt = require("jsonwebtoken");
 const { v4: uuidv4 } = require("uuid");
-
-
-const { getAddress, verifyMessage } = require("ethers");
+const { ethers, getAddress, verifyMessage } = require("ethers");
 
 dotenv.config();
 
@@ -16,12 +13,22 @@ const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || "http://localhost:5173";
 app.use(cors({ origin: FRONTEND_ORIGIN }));
 app.use(express.json());
 
+
 const PORT = process.env.PORT || 5000;
 const JWT_SECRET = process.env.JWT_SECRET || "dev_secret_change_me";
 
 
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const RPC_URL = process.env.INFURA_URL || "https://rpc.ankr.com/eth_goerli"; // testnet fallback
+
+if (!PRIVATE_KEY) throw new Error("PRIVATE_KEY missing from .env");
+
+const provider = new ethers.JsonRpcProvider(RPC_URL);
+const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+
+
 const nonceStore = new Map();
-const NONCE_TTL_MS = 1000 * 60 * 5; 
+const NONCE_TTL_MS = 1000 * 60 * 5; // 5 min
 
 function createNonceFor(address) {
   const nonce = `Sign this message to authenticate. Nonce: ${uuidv4()}`;
@@ -39,16 +46,57 @@ function getNonceFor(address) {
   return rec.nonce;
 }
 
-
 function normalizeAddress(addr) {
   try {
     return getAddress(addr);
-  } catch (err) {
+  } catch {
     return null;
   }
 }
 
+// -----------------------------
+// Routes: Wallet
+// -----------------------------
+app.get("/balance", async (req, res) => {
+  try {
+    const balance = await provider.getBalance(wallet.address);
+    res.json({
+      address: wallet.address,
+      balance: ethers.formatEther(balance) + " ETH",
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
+app.post("/send", async (req, res) => {
+  try {
+    const { to, amount } = req.body;
+    if (!to || !amount) {
+      return res.status(400).json({ error: "Missing 'to' or 'amount'" });
+    }
+
+    const tx = {
+      to,
+      value: ethers.parseEther(amount.toString()),
+    };
+
+    const txResponse = await wallet.sendTransaction(tx);
+    const receipt = await txResponse.wait();
+
+    res.json({
+      message: "Transaction successful!",
+      txHash: receipt.hash,
+      blockNumber: receipt.blockNumber,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// -----------------------------
+// Routes: Authentication
+// -----------------------------
 app.all("/api/nonce", (req, res) => {
   const address = req.method === "GET" ? req.query.address : req.body.address;
   if (!address) return res.status(400).json({ error: "address required" });
@@ -60,26 +108,29 @@ app.all("/api/nonce", (req, res) => {
   return res.json({ address: normalized, nonce });
 });
 
-
 app.post("/api/verify", async (req, res) => {
   const { address, signature } = req.body;
-  if (!address || !signature) return res.status(400).json({ error: "address and signature required" });
+  if (!address || !signature)
+    return res.status(400).json({ error: "address and signature required" });
 
   const normalized = normalizeAddress(address);
   if (!normalized) return res.status(400).json({ error: "invalid address" });
 
   const nonce = getNonceFor(normalized);
-  if (!nonce) return res.status(400).json({ error: "nonce not found; request a new nonce" });
+  if (!nonce)
+    return res.status(400).json({ error: "nonce not found; request a new nonce" });
 
   try {
     const recovered = verifyMessage(nonce, signature);
     const recoveredNormalized = normalizeAddress(recovered);
+
     if (recoveredNormalized !== normalized) {
       return res.status(401).json({ error: "signature verification failed" });
     }
 
     const token = jwt.sign({ address: normalized }, JWT_SECRET, { expiresIn: "1h" });
     nonceStore.delete(normalized);
+
     return res.json({ success: true, token });
   } catch (err) {
     console.error("verify error:", err);
@@ -87,26 +138,28 @@ app.post("/api/verify", async (req, res) => {
   }
 });
 
-
 app.get("/api/me", (req, res) => {
   const auth = req.headers.authorization;
   if (!auth) return res.status(401).json({ error: "missing auth header" });
 
   const parts = auth.split(" ");
-  if (parts.length !== 2 || parts[0] !== "Bearer") return res.status(401).json({ error: "invalid auth header" });
+  if (parts.length !== 2 || parts[0] !== "Bearer")
+    return res.status(401).json({ error: "invalid auth header" });
 
   const token = parts[1];
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     return res.json({ authenticated: true, address: payload.address });
-  } catch (err) {
+  } catch {
     return res.status(401).json({ error: "invalid or expired token" });
   }
 });
 
-
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
+// -----------------------------
+// Start server
+// -----------------------------
 app.listen(PORT, () => {
   console.log(`Backend listening on http://localhost:${PORT}`);
   console.log(`CORS allowed origin: ${FRONTEND_ORIGIN}`);
